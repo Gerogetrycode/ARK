@@ -84,3 +84,31 @@ class ENodeExist(Exception):
     节点已存在
     """
     pass
+
+
+class ControlFailed(Exception):
+    """
+    控制失败
+    """
+    pass
+
+
+class EPNoNodeError(Exception):
+    """
+    持久化节点不存在
+    """
+    pass
+
+
+class EPIOError(Exception):
+    """
+    持久化IO异常
+    """
+    pass
+
+
+class EPConnectTimeout(Exception):
+    """
+    持久化连接超时
+    """
+    pass

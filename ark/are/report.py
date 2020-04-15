@@ -12,14 +12,14 @@
 
 import SocketServer
 import multiprocessing
-import traceback
 import urlparse
+import string
 from SimpleHTTPServer import SimpleHTTPRequestHandler
 
-from are import config
-from are import log
-from are import client
-from are import exception
+from ark.are import config
+from ark.are import log
+from ark.are import client
+from ark.are import exception
 
 
 class RequestHandler(SimpleHTTPRequestHandler):
@@ -71,7 +71,7 @@ class RequestHandler(SimpleHTTPRequestHandler):
             esc = client.ESClient("ark", "operation")
             response = esc.get_data_with_condition(condition)
         except exception.EFailedRequest as e:
-            log.error(str(e.reason))
+            log.f(str(e.reason))
         finally:
             return response
 
@@ -85,7 +85,8 @@ class ArkServer(object):
         """
         初始化方法
         """
-        self._port = config.GuardianConfig.get("ARK_SERVER_PORT")
+
+        self._port = string.atoi(config.GuardianConfig.get("ARK_SERVER_PORT"))
 
     def start(self, daemon=True):
         """
@@ -109,6 +110,6 @@ class ArkServer(object):
             SocketServer.TCPServer.allow_reuse_address = True
             _server = SocketServer.TCPServer(('', self._port), handler)
             _server.serve_forever()
-        except Exception:
-            log.error('Generic Exception' + traceback.format_exc())
+        except:
+            log.f('Generic Exception')
 

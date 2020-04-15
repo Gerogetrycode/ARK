@@ -10,19 +10,15 @@
 
 .. Note:: 当前状态服务由zookeeper实现
 """
-import json
 import pickle
 import time
+import copy
 
-from are import config
-from are.client import ESClient
-from are.client import ZkClient
-from are.common import Singleton
-from are import exception
-from are import log
-
-CONTEXT_PATH = "/{}/context"
-GUARDIAN_ID = "GUARDIAN_ID"
+from ark.are import config
+from ark.are import persistence
+from ark.are import exception
+from ark.are import log
+from ark.are.common import Singleton
 
 
 class GuardianContext(Singleton):
@@ -55,11 +51,24 @@ class GuardianContext(Singleton):
         :return: context对象
         :rtype: GuardianContext
         """
-        context_path = CONTEXT_PATH.format(
-            config.GuardianConfig.get(GUARDIAN_ID))
-        data = ZkClient().get_data(context_path)
-        log.debug("load context from zookeeper success")
+        context_path = config.GuardianConfig.get_persistent_path("context")
+        data = persistence.PersistenceDriver().get_data(context_path)
+        log.i("load context success")
         guardian_context = pickle.loads(data) if data else GuardianContext()
+        # load状态机信息
+        operations_path = config.GuardianConfig.get_persistent_path("operations")
+        # operations子节点名称均为operation_id
+        operation_ids = persistence.PersistenceDriver().get_children(operations_path)
+        for operation_id in operation_ids:
+            operation_path = operations_path + "/" + operation_id
+            try:
+                operation_data = persistence.PersistenceDriver().get_data(operation_path)
+                log.i("load operation[{}] success".format(operation_id))
+                operation = pickle.loads(operation_data)
+                guardian_context.operations[operation_id] = operation
+            except:
+                log.f("load operation {} failed".format(operation_id))
+
         cls._context = guardian_context
         return guardian_context
 
@@ -75,11 +84,28 @@ class GuardianContext(Singleton):
                  持久化。
 
         """
-        self.__guardian_id = config.GuardianConfig.get(GUARDIAN_ID)
+        self.__guardian_id = config.GuardianConfig.get(config.GUARDIAN_ID_NAME)
         self.message_list = []
         self.operations = {}
         self.extend = {}
         self.lock = False
+
+    def save_operation(self, operation):
+        """
+        持久化状态机信息
+        :param operation:
+        :return:
+        """
+        if not self.lock:
+            log.e("current guardian instance no privilege to save operation")
+            raise exception.EInvalidOperation(
+                "current guardian instance no privilege to save operation")
+        operation_path = config.GuardianConfig.get_persistent_path("operations") \
+                         + "/" + operation.operation_id
+        if not persistence.PersistenceDriver().exists(operation_path):
+            persistence.PersistenceDriver().create_node(path=operation_path)
+        persistence.PersistenceDriver().save_data(operation_path, pickle.dumps(operation))
+        log.i("save operation_id:{} success".format(operation.operation_id))
 
     def save_context(self):
         """
@@ -90,12 +116,16 @@ class GuardianContext(Singleton):
         :raises EInvalidOperation: 非法操作
         """
         if not self.lock:
-            log.error("current guardian instance no privilege to save context")
+            log.e("current guardian instance no privilege to save context")
             raise exception.EInvalidOperation(
                 "current guardian instance no privilege to save context")
-        context_path = CONTEXT_PATH.format(self.__guardian_id)
-        ZkClient().save_data(context_path, pickle.dumps(self))
-        log.info("save context success")
+        context_path = config.GuardianConfig.get_persistent_path("context")
+        context_to_persist = copy.deepcopy(self)
+        # 考虑反序列化时可能异常，不使用del删除属性operations
+        context_to_persist.operations = {}
+        persistence.PersistenceDriver().save_data(context_path, pickle.dumps(context_to_persist))
+
+        log.i("save context success")
 
     def update_lock(self, is_lock):
         """
@@ -106,7 +136,7 @@ class GuardianContext(Singleton):
         :rtype: None
         """
         self.lock = is_lock
-        log.info("update context lock, {}".format(self.lock))
+        log.i("update context lock, {}".format(self.lock))
 
     def create_operation(self, operation_id, operation):
         """
@@ -117,9 +147,9 @@ class GuardianContext(Singleton):
         :return: 无返回
         :rtype: None
         """
-        self.operations[operation_id] =operation
-        self.save_context()
-        log.info("create new operation success, operation_id:{}".
+        self.operations[operation_id] = operation
+        self.save_operation(operation)
+        log.i("create new operation success, operation_id:{}".
                  format(operation_id))
 
     def delete_operation(self, operation_id):
@@ -131,8 +161,10 @@ class GuardianContext(Singleton):
         :rtype: None
         """
         del self.operations[operation_id]
-        self.save_context()
-        log.info("delete operation from context success, operation_id:{}".
+        operation_path = config.GuardianConfig.get_persistent_path("operations")\
+                         + "/" + operation_id
+        persistence.PersistenceDriver().delete_node(operation_path)
+        log.i("delete operation from context success, operation_id:{}".
                  format(operation_id))
 
     def get_operation(self, operation_id):
@@ -155,8 +187,8 @@ class GuardianContext(Singleton):
         :rtype: None
         """
         self.operations[operation_id] = operation
-        self.save_context()
-        log.info("update operation success, operation_id:{}".
+        self.save_operation(operation)
+        log.i("update operation success, operation_id:{}".
                  format(operation_id))
 
     def get_extend(self):
@@ -178,7 +210,7 @@ class GuardianContext(Singleton):
         """
         self.extend.update(params)
         self.save_context()
-        log.info("update extend success, current extend:{}".format(self.extend))
+        log.i("update extend success, current extend:{}".format(self.extend))
 
     def del_extend(self, key):
         """
@@ -190,7 +222,7 @@ class GuardianContext(Singleton):
         """
         del self.extend[key]
         self.save_context()
-        log.info("delete extend success, current extend:{}".format(self.extend))
+        log.i("delete extend success, current extend:{}".format(self.extend))
 
     @staticmethod
     def new_period(func):
@@ -203,26 +235,32 @@ class GuardianContext(Singleton):
         """
         def wrapper(send_obj, message):
             """
-
             :param send_obj:
             :param message:
             :return:
             """
+            # 避免循环import和局部import
+            if message.__class__.__name__ != "OperationMessage":
+                raise exception.ETypeMismatch("only OperationMessage can be send()")
+            if not message.operation_id:
+                raise exception.EMissingParam("OperationMessage need operation_id")
             if message.name == "SENSED_MESSAGE" or \
-                            message.name == "DECIDED_MESSAGE" or \
-                            message.name == "COMPLETE_MESSAGE":
+               message.name == "DECIDED_MESSAGE" or \
+               message.name == "COMPLETE_MESSAGE":
                 guardian_context = GuardianContext.get_context()
                 try:
                     operation = guardian_context.get_operation(
                         message.operation_id)
                 except KeyError:
+                    # 此处使用深拷贝，防止后续处理中造成环形引用
                     operation = Operation(
-                        message.operation_id, message.params)
+                        message.operation_id, copy.deepcopy(message.params))
                     guardian_context.create_operation(
                         message.operation_id, operation)
                 operation.append_period(message.name)
             ret = func(send_obj, message)
             return ret
+
         return wrapper
 
     @staticmethod
@@ -241,6 +279,11 @@ class GuardianContext(Singleton):
             :param message:
             :return:
             """
+            # 避免循环import和局部import
+            if message.__class__.__name__ != "OperationMessage":
+                raise exception.ETypeMismatch("only OperationMessage can be send()")
+            if not message.operation_id:
+                raise exception.EMissingParam("OperationMessage need operation_id")
             if message.name == "COMPLETE_MESSAGE":
                 guardian_context = GuardianContext.get_context()
                 operation = guardian_context.get_operation(message.operation_id)
@@ -269,24 +312,42 @@ class GuardianContext(Singleton):
             :param message:
             :return:
             """
-            if message.name == "STATE_COMPLETE_MESSAGE":
+            # 避免循环import和局部import
+            if message.__class__.__name__ != "OperationMessage":
+                raise exception.ETypeMismatch("only OperationMessage can be send()")
+            if not message.operation_id:
+                raise exception.EMissingParam("OperationMessage need operation_id")
+            if message.name == "STATE_COMPLETE_MESSAGE" or \
+                    message.name == "PERSIST_SESSION_MESSAGE":
                 guardian_context = GuardianContext.get_context()
                 operation = guardian_context.get_operation(
                     message.operation_id)
                 finished_node = message.params["finished_node"]
                 current_node = message.params["current_node"]
                 timestamp = message.params["timestamp"]
+                session = message.params["session"]
                 if current_node:
                     operation.add_action(current_node)
                 if finished_node:
                     operation.update_action(
                         finished_node, "FINISHED", timestamp)
+                if session:
+                    operation.update_session(session)
+
+                # 状态机节点持久化
+                guardian_context.update_operation(operation.operation_id, operation)
             else:
                 pass
             ret = func(send_obj, message)
             return ret
         return wrapper
 
+    def is_operation_id_in_message_list(self, operation_id):
+        for message in self.message_list:
+            if message.name != "IDLE_MESSAGE" and message.operation_id == operation_id:
+                return True
+        return False
+        
 
 class Operation(object):
     """
@@ -365,14 +426,20 @@ class Operation(object):
         :return: 无返回
         :rtype: None
         """
-        try:
-            ESClient("ark", "operation").put_data(self.operation_id, json.dumps(
-                self, default=lambda obj: obj.__dict__))
-        except Exception as e:
-            log.error("record operation err:{}".format(e))
-        else:
-            log.info("record action success, operation_id:{}".format(
-                self.operation_id))
+        # try:
+        #     ESClient("ark", "operation").put_data(self.operation_id, json.dumps(
+        #         self, default=lambda obj: obj.__dict__))
+        # except Exception as e:
+        #     log.f("record operation err")
+        # else:
+        #     log.i("record action success, operation_id:{}".format(
+        #         self.operation_id))
+
+    def update_session(self, session):
+        """
+        状态及处理完一个节点之后，更新session
+        """
+        self.session = session
 
 
 class Periods(object):
@@ -484,3 +551,44 @@ class Action(object):
         self.status = status or "CREATE"
         self.startTime = start_time or int(time.time())
         self.endTime = end_time or 2147483647
+
+
+class FlushFlag(object):
+    """
+    刷新标记，提供一系列用于上下文刷新控制的函数支持
+    """
+    def get_flush(self):
+        """
+        获取标记判断是否需要进行flush
+        :return: flag
+        :rtype: bool
+        """
+        self._flush_flag = self._flush_flag if hasattr(self, "_flush_flag") else False
+        return self._flush_flag
+
+    def set_flush(self, flag):
+        """
+        设置标记判断是否需要进行flush
+        :param bool flag: 是否需要进行刷新
+        :return: 无返回
+        :rtype: None
+        """
+        self._flush_flag = flag
+
+    def flush(self):
+        """
+        设置标记以进行flush
+        :return: 无返回
+        :rtype: None
+        """
+        self._flush_flag = True
+
+    def reset_flush(self):
+        """
+        标记完成flush，同时返回之前的标记
+        :return: flag
+        :rtype: bool
+        """
+        flag = self.get_flush()
+        self._flush_flag = False
+        return flag

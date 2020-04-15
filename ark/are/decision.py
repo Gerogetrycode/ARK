@@ -9,9 +9,10 @@
 """
 import copy
 
-from are import framework
-from are import exception
-from are import log
+from ark.are import framework
+from ark.are import exception
+from ark.are import log
+from ark.are import context
 
 
 class DecisionMaker(framework.BaseDecisionMaker):
@@ -34,7 +35,7 @@ class DecisionMaker(framework.BaseDecisionMaker):
         :rtype: None
         :raises EUnknownEvent: 位置事件异常
         """
-        log.info("on decision message:{}".format(message.name))
+        log.i("on decision message:{}".format(message.name))
         if message.name == "SENSED_MESSAGE":
             decided_message = self.decision_logic(message)
             self.send(decided_message)
@@ -95,7 +96,7 @@ class KeyMappingDecisionMaker(DecisionMaker):
         :rtype: Message
         :raises ETypeMismatch: 事件参数不匹配异常
         """
-        log.info("begin decision logic, message:{}".format(message.name))
+        log.i("begin decision logic, message:{}".format(message.name))
         operation_id = message.operation_id
         params = message.params
         if self._from_key in params \
@@ -117,9 +118,11 @@ class StateMachineDecisionMaker(DecisionMaker):
     """
     def decision_logic(self, message):
         """
+        状态机决策逻辑，该函数直接根据Message生成决策完成的消息对象
 
-        :param message:
-        :return:
+        :param Message message: 感知完成的消息对象
+        :return: 决策完成的消息对象
+        :rtype: Message
         """
         decided_message = framework.OperationMessage(
             "DECIDED_MESSAGE", message.operation_id, message.params)
